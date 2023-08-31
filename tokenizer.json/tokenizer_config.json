@@ -1,0 +1,12 @@
+{
+  "bos_token": "<s>",
+  "do_lower_case": false,
+  "eos_token": "</s>",
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "<pad>",
+  "replace_word_delimiter_char": " ",
+  "special_tokens_map_file": "C:\\Users\\alvin/.cache\\huggingface\\hub\\models--facebook--hubert-large-ls960-ft\\snapshots\\ece5fabbf034c1073acae96d5401b25be96709d8\\special_tokens_map.json",
+  "tokenizer_class": "Wav2Vec2CTCTokenizer",
+  "unk_token": "<unk>",
+  "word_delimiter_token": "|"
+}

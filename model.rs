@@ -1,7 +1,6 @@
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::{Conv1d, Conv1dConfig, Embedding, Module, VarBuilder};
+use candle::{DType, Device, Result,IndexOp,Tensor};
+use candle_nn::{Conv1d, Conv1dConfig, Module, VarBuilder};
 use serde::Deserialize;
-use tracing_subscriber::Layer;
 
 pub const DTYPE: DType = DType::F32;
 
@@ -26,9 +25,6 @@ impl HiddenActLayer {
     fn forward(&self, xs: &Tensor) -> candle::Result<Tensor> {
         let _enter = self.span.enter();
         match self.act {
-            // TODO: The all-MiniLM-L6-v2 model uses "gelu" whereas this is "gelu_new", this explains some
-            // small numerical difference.
-            // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
             HiddenAct::Gelu => xs.gelu(),
             HiddenAct::Relu => xs.relu(),
         }
@@ -119,8 +115,21 @@ fn conv1d(
     let bias = vb.get(out_channels, "bias")?;
     Ok(Conv1d::new(weight, Some(bias), config))
 }
+pub fn conv1d_weight_norm(
+    in_c: usize,
+    out_c: usize,
+    kernel_size: usize,
+    config: Conv1dConfig,
+    vb: VarBuilder,
+) -> Result<Conv1d> {
+    let weight_g = vb.get((1, 1, kernel_size), "weight_g")?;
+    let weight_v = vb.get((out_c, config.padding, kernel_size), "weight_v")?;
+    let norm_v = weight_v.sqr()?.sum_keepdim((0, 1))?.sqrt()?;
+    let weight = weight_v.broadcast_mul(&weight_g)?.broadcast_div(&norm_v)?;
+    let bias = vb.get(out_c, "bias")?;
+    Ok(Conv1d::new(weight, Some(bias), config))
+}
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/Hubert/configuration_Hubert.py#L1
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     activation_dropout: f64,
@@ -163,7 +172,7 @@ pub struct Config {
     num_hidden_layers: usize,
     pad_token_id: u32,
     vocab_size: usize,
-    feat_proj_layer_norm: bool
+    feat_proj_layer_norm: Option<bool>,
 }
 
 impl Default for Config {
@@ -176,8 +185,8 @@ impl Default for Config {
             bos_token_id: 1,
             conv_bias: true,
             conv_dim: vec![512, 512, 512, 512, 512, 512, 512, 512],
-            conv_kernel: vec![10,3,3,3,3,2,2],
-            conv_stride: vec![5,2,2,2,2,2,2],
+            conv_kernel: vec![10, 3, 3, 3, 3, 2, 2],
+            conv_stride: vec![5, 2, 2, 2, 2, 2, 2],
             ctc_loss_reduction: String::from("sum"),
             ctc_zero_infinity: false,
             diversity_loss_weight: 0.1,
@@ -209,13 +218,13 @@ impl Default for Config {
             num_hidden_layers: 24,
             pad_token_id: 0,
             vocab_size: 32,
-            feat_proj_layer_norm: false
+            feat_proj_layer_norm: Some(true),
         }
     }
 }
 
 impl Config {
-    fn _hubert_large_ft() -> Self {
+    pub fn _hubert_large_ft() -> Self {
         // https://huggingface.co/facebook/hubert-large-ls960-ft/blob/main/config.json
         Self {
             activation_dropout: 0.1,
@@ -225,8 +234,8 @@ impl Config {
             bos_token_id: 1,
             conv_bias: true,
             conv_dim: vec![512, 512, 512, 512, 512, 512, 512, 512],
-            conv_kernel: vec![10,3,3,3,3,2,2],
-            conv_stride: vec![5,2,2,2,2,2,2],
+            conv_kernel: vec![10, 3, 3, 3, 3, 2, 2],
+            conv_stride: vec![5, 2, 2, 2, 2, 2, 2],
             ctc_loss_reduction: String::from("sum"),
             ctc_zero_infinity: false,
             diversity_loss_weight: 0.1,
@@ -258,14 +267,9 @@ impl Config {
             num_hidden_layers: 24,
             pad_token_id: 0,
             vocab_size: 32,
-            feat_proj_layer_norm: false
+            feat_proj_layer_norm: Some(true),
         }
     }
-}
-
-fn embedding(vocab_size: usize, hidden_size: usize, vb: VarBuilder) -> Result<Embedding> {
-    let embeddings = vb.get((vocab_size, hidden_size), "weight")?;
-    Ok(Embedding::new(embeddings, hidden_size))
 }
 
 fn linear(size1: usize, size2: usize, vb: VarBuilder) -> Result<Linear> {
@@ -321,9 +325,9 @@ impl HubertSelfAttention {
         let all_head_size = config.num_attention_heads * attention_head_size;
         let dropout = Dropout::new(config.hidden_dropout_prob);
         let hidden_size = config.hidden_size;
-        let query = linear(hidden_size, all_head_size, vb.pp("query"))?;
-        let value = linear(hidden_size, all_head_size, vb.pp("value"))?;
-        let key = linear(hidden_size, all_head_size, vb.pp("key"))?;
+        let query = linear(hidden_size, all_head_size, vb.pp("q_proj"))?;
+        let value = linear(hidden_size, all_head_size, vb.pp("v_proj"))?;
+        let key = linear(hidden_size, all_head_size, vb.pp("k_proj"))?;
         Ok(Self {
             query,
             key,
@@ -372,23 +376,16 @@ impl HubertSelfAttention {
 
 struct HubertSelfOutput {
     dense: Linear,
-    layer_norm: LayerNorm,
     dropout: Dropout,
     span: tracing::Span,
 }
 
 impl HubertSelfOutput {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = linear(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
-        let layer_norm = layer_norm_fn(
-            config.hidden_size,
-            config.layer_norm_eps,
-            vb.pp("LayerNorm"),
-        )?;
+        let dense = linear(config.hidden_size, config.hidden_size, vb.pp("out_proj"))?;
         let dropout = Dropout::new(config.hidden_dropout_prob);
         Ok(Self {
             dense,
-            layer_norm,
             dropout,
             span: tracing::span!(tracing::Level::TRACE, "self-out"),
         })
@@ -398,11 +395,10 @@ impl HubertSelfOutput {
         let _enter = self.span.enter();
         let hidden_states = self.dense.forward(hidden_states)?;
         let hidden_states = self.dropout.forward(&hidden_states)?;
-        self.layer_norm.forward(&(hidden_states + input_tensor)?)
+        hidden_states + input_tensor
     }
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/Hubert/modeling_Hubert.py#L392
 struct HubertAttention {
     self_attention: HubertSelfAttention,
     self_output: HubertSelfOutput,
@@ -411,8 +407,8 @@ struct HubertAttention {
 
 impl HubertAttention {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let self_attention = HubertSelfAttention::load(vb.pp("self"), config)?;
-        let self_output = HubertSelfOutput::load(vb.pp("output"), config)?;
+        let self_attention = HubertSelfAttention::load(vb.clone(), config)?;
+        let self_output = HubertSelfOutput::load(vb.clone(), config)?;
         Ok(Self {
             self_attention,
             self_output,
@@ -441,16 +437,16 @@ impl HubertEncoderLayerStableLayerNorm {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let attention = HubertAttention::load(vb.pp("attention"), config)?;
         let dropout = Dropout::new(config.hidden_dropout);
-        let feed_forward = HubertFeedForward::load(vb.pp("attention"), config)?;
+        let feed_forward = HubertFeedForward::load(vb.pp("feed_forward"), config)?;
         let layer_norm = layer_norm_fn(
             config.hidden_size,
             config.layer_norm_eps,
-            vb.pp("LayerNorm"),
+            vb.pp("layer_norm"),
         )?;
         let final_layer_norm = layer_norm_fn(
             config.hidden_size,
             config.layer_norm_eps,
-            vb.pp("LayerNorm"),
+            vb.pp("final_layer_norm"),
         )?;
 
         Ok(Self {
@@ -471,10 +467,7 @@ impl HubertEncoderLayerStableLayerNorm {
         let hidden_states = self.dropout.forward(&attention_output);
         let hidden_states = (attn_residual + hidden_states)?;
         let norm_states = self.final_layer_norm.forward(&hidden_states)?;
-        hidden_states
-            + self
-                .feed_forward
-                .forward(&norm_states)
+        hidden_states + self.feed_forward.forward(&norm_states)
     }
 }
 
@@ -488,18 +481,16 @@ struct HubertEncoderStableLayerNorm {
 
 impl HubertEncoderStableLayerNorm {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        // TODO: layer name
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
-                HubertEncoderLayerStableLayerNorm::load(vb.pp(&format!("layer.{index}")), config)
+                HubertEncoderLayerStableLayerNorm::load(vb.pp(&format!("layers.{index}")), config)
             })
             .collect::<Result<Vec<_>>>()?;
-        let pos_conv_embed =
-            HubertPositionalConvEmbedding::load(vb.pp(&format!("layer")), &config)?;
+        let pos_conv_embed = HubertPositionalConvEmbedding::load(vb.pp("pos_conv_embed"), config)?;
         let layer_norm = layer_norm_fn(
             config.hidden_size,
             config.layer_norm_eps,
-            vb.pp("LayerNorm"),
+            vb.pp("layer_norm"),
         )?;
         let dropout = Dropout::new(config.hidden_dropout);
 
@@ -538,7 +529,7 @@ pub struct HubertLayerNormConvLayer {
 
 impl HubertLayerNormConvLayer {
     fn load(vb: VarBuilder, cfg: &Config, layer_id: usize) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "audio-encoder");
+        let span = tracing::span!(tracing::Level::TRACE, "HubertLayerNormConvLayer");
 
         let in_conv_dim = if layer_id > 0 {
             cfg.conv_dim[layer_id - 1]
@@ -557,10 +548,10 @@ impl HubertLayerNormConvLayer {
             out_conv_dim,
             cfg.conv_kernel[layer_id],
             cfg1,
-            vb.pp("conv1"),
+            vb.pp("conv"),
         )?;
         let activation = HiddenActLayer::new(cfg.feat_extract_activation);
-        let layer_norm = layer_norm_fn(out_conv_dim, cfg.layer_norm_eps, vb.pp("LayerNorm"))?;
+        let layer_norm = layer_norm_fn(out_conv_dim, cfg.layer_norm_eps, vb.pp("layer_norm"))?;
 
         Ok(Self {
             conv,
@@ -570,11 +561,12 @@ impl HubertLayerNormConvLayer {
         })
     }
 
-    pub fn forward(&mut self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let hidden_states = self.conv.forward(&hidden_states)?;
+        let hidden_states = hidden_states.transpose(1,2)?;
         let hidden_states = self.layer_norm.forward(&hidden_states)?;
-        // TODO: Padding [:, :, :-1]
+        let hidden_states = hidden_states.transpose(1,2)?;
         self.activation.forward(&hidden_states)
     }
 }
@@ -587,18 +579,18 @@ pub struct HubertPositionalConvEmbedding {
 
 impl HubertPositionalConvEmbedding {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "audio-encoder");
+        let span = tracing::span!(tracing::Level::TRACE, "HubertPositionalConvEmbedding");
         let cfg1 = Conv1dConfig {
             padding: cfg.num_conv_pos_embeddings / 2,
             stride: 1,
             groups: cfg.num_conv_pos_embedding_groups,
         };
-        let conv = conv1d(
+        let conv = conv1d_weight_norm(
             cfg.hidden_size,
             cfg.hidden_size,
             cfg.num_conv_pos_embeddings,
             cfg1,
-            vb.pp("conv1"),
+            vb.pp("conv"),
         )?;
         let activation = HiddenActLayer::new(cfg.feat_extract_activation);
 
@@ -609,11 +601,11 @@ impl HubertPositionalConvEmbedding {
         })
     }
 
-    pub fn forward(&mut self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let hidden_states = hidden_states.transpose(1, 2)?;
         let hidden_states = self.conv.forward(&hidden_states)?;
-        // TODO: Padding [:, :, :-1]
+        let hidden_states = hidden_states.i((.., .., ..hidden_states.dims()[2]-1))?;
         let hidden_states = self.activation.forward(&hidden_states)?;
         hidden_states.transpose(1, 2)
     }
@@ -629,9 +621,9 @@ impl HubertFeatureEncoder {
         let layers = (0..config.num_feat_extract_layers)
             .map(|index| {
                 HubertLayerNormConvLayer::load(
-                    vb.pp(&format!("hubert.feature_extractor.conv_layers.{index}")),
+                    vb.pp(&format!("conv_layers.{index}")),
                     config,
-                    index
+                    index,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -643,7 +635,7 @@ impl HubertFeatureEncoder {
         let _enter = self.span.enter();
         let mut hidden_states = hidden_states.clone();
         for layer in self.layers.iter() {
-            hidden_states = layer.forward(&hidden_states)?
+            hidden_states = layer.forward(&hidden_states)?;
         }
         Ok(hidden_states)
     }
@@ -660,8 +652,16 @@ struct HubertFeedForward {
 
 impl HubertFeedForward {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let intermediate_dense = linear(config.hidden_size, config.intermediate_size, vb.pp("dense"))?;
-        let output_dense = linear(config.intermediate_size, config.hidden_size, vb.pp("dense"))?;
+        let intermediate_dense = linear(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("intermediate_dense"),
+        )?;
+        let output_dense = linear(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("output_dense"),
+        )?;
         let intermediate_act_fn = HiddenActLayer::new(config.feat_extract_activation);
         let intermediate_dropout = Dropout::new(config.activation_dropout);
         let output_dropout = Dropout::new(config.hidden_dropout);
@@ -695,15 +695,24 @@ struct HubertFeatureProjection {
 
 impl HubertFeatureProjection {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let dense = linear(config.conv_dim[config.conv_dim.len()], config.hidden_size, vb.pp("dense"))?;
-        let layer_norm = if config.feat_proj_layer_norm {
-            Some(layer_norm_fn(
-                config.hidden_size,
-                config.layer_norm_eps,
-                vb.pp("LayerNorm"),
-            )?)
-        } else {
-            None
+        let dense = linear(
+            config.conv_dim[config.conv_dim.len()-1],
+            config.hidden_size,
+            vb.pp("projection"),
+        )?;
+        let layer_norm: Option<LayerNorm> = match config.feat_proj_layer_norm {
+            Some(feat_proj_layer_norm) => {
+                if feat_proj_layer_norm {
+                    Some(layer_norm_fn(
+                        config.conv_dim[config.conv_dim.len()-1],
+                        config.layer_norm_eps,
+                        vb.pp("layer_norm"),
+                    )?)
+                } else {
+                    None
+                }
+            }
+            None => None,
         };
         let dropout = Dropout::new(config.feat_proj_dropout);
         Ok(Self {
@@ -716,19 +725,19 @@ impl HubertFeatureProjection {
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        if let Some(layer_norm) = &mut self.layer_norm {
-            layer_norm.forward(&hidden_states);
+        let mut hidden_states = hidden_states.clone();
+        if let Some(layer_norm) = &self.layer_norm {
+            hidden_states = layer_norm.forward(&hidden_states)?;
         }
-        let hidden_states = self.dense.forward(hidden_states)?;
+        let hidden_states = self.dense.forward(&hidden_states)?;
         self.dropout.forward(&hidden_states)
     }
 }
 
-// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/Hubert/modeling_Hubert.py#L874
 pub struct HubertModel {
     feature_extractor: HubertFeatureEncoder,
     feature_projection: HubertFeatureProjection,
-    encoder: HubertEncoderLayerStableLayerNorm,
+    encoder: HubertEncoderStableLayerNorm,
     pub device: Device,
     span: tracing::Span,
 }
@@ -736,9 +745,9 @@ pub struct HubertModel {
 impl HubertModel {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let (feature_extractor, feature_projection, encoder) = match (
-            HubertFeatureEncoder::load(vb.pp("feature_encoder"), config),
+            HubertFeatureEncoder::load(vb.pp("feature_extractor"), config),
             HubertFeatureProjection::load(vb.pp("feature_projection"), config),
-            HubertEncoderLayerStableLayerNorm::load(vb.pp("encoder"), config),
+            HubertEncoderStableLayerNorm::load(vb.pp("encoder"), config),
         ) {
             (Ok(feature_extractor), Ok(feature_projection), Ok(encoder)) => {
                 (feature_extractor, feature_projection, encoder)
@@ -754,7 +763,10 @@ impl HubertModel {
                             vb.pp(&format!("{model_type}.feature_projection")),
                             config,
                         ),
-                        HubertEncoderLayerStableLayerNorm::load(vb.pp(&format!("{model_type}.encoder")), config),
+                        HubertEncoderStableLayerNorm::load(
+                            vb.pp(&format!("{model_type}.encoder")),
+                            config,
+                        ),
                     ) {
                         (feature_extractor, feature_projection, encoder)
                     } else {
@@ -774,11 +786,48 @@ impl HubertModel {
         })
     }
 
-    pub fn forward(&self, input_values: &Tensor, token_type_ids: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, input_values: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let extract_features = self.feature_extractor.forward(input_values)?;
+        let input_values = input_values.unsqueeze(1)?;
+        let extract_features = self.feature_extractor.forward(&input_values)?;
+        let extract_features = extract_features.transpose(1, 2)?;
         let hidden_states = self.feature_projection.forward(&extract_features)?;
         let encoder_outputs = self.encoder.forward(&hidden_states)?;
         Ok(encoder_outputs)
+    }
+}
+
+pub struct HubertForCTC {
+    pub model: HubertModel,
+    dropout: Dropout,
+    pub lm_head: Linear,
+    pub config: Config,
+    pub device: Device,
+    span: tracing::Span,
+}
+
+impl HubertForCTC {
+    pub fn load(vb: VarBuilder, config: Config) -> Result<Self> {
+        let model = HubertModel::load(vb.pp("hubert"), &config)?;
+        let dropout = Dropout::new(config.feat_proj_dropout);
+        let lm_head = linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
+
+        Ok(Self {
+            model,
+            dropout,
+            lm_head,
+            config,
+            device: vb.device().clone(),
+            span: tracing::span!(tracing::Level::TRACE, "model"),
+        })
+    }
+
+    pub fn forward(&self, input_values: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let hidden_states = self.model.forward(&input_values)?;
+        let hidden_states = self.dropout.forward(&hidden_states)?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+
+        Ok(logits)
     }
 }

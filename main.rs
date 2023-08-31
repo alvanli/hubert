@@ -5,13 +5,23 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 mod model;
 
-use anyhow::{anyhow, Error as E, Result};
-use candle::Tensor;
+use std::path::PathBuf;
+use regex::Regex;
+use anyhow::{Result};
+
+use candle::{Tensor, IndexOp, D};
+use serde_json::{Map, Value};
 use candle_nn::VarBuilder;
 use clap::Parser;
-use hf_hub::{api::sync::Api, Cache, Repo, RepoType};
-use model::{BertModel, Config, DTYPE};
-use tokenizers::{PaddingParams, Tokenizer};
+use hf_hub::{api::sync::Api, Repo, RepoType};
+use model::{Config, HubertForCTC, DTYPE};
+
+// https://huggingface.co/facebook/hubert-large-ls960-ft/blob/main/preprocessor_config.json
+const SAMPLE_RATE: usize = 16000;
+
+// https://huggingface.co/facebook/hubert-large-ls960-ft/blob/main/tokenizer_config.json
+const UNK_TOKEN: &str = "<unk>";
+const PAD_TOKEN: &str = "<pad>";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -27,6 +37,12 @@ struct Args {
     /// Enable tracing (generates a trace-timestamp.json file).
     #[arg(long)]
     tracing: bool,
+
+    /// The input to be processed, in wav format, will default to `jfk.wav`. Alternatively
+    /// this can be set to sample:jfk, sample:gb1, ... to fetch a sample from the following
+    /// repo: https://huggingface.co/datasets/Narsil/candle_demo/
+    #[arg(long)]
+    input: Option<String>,
 
     /// The model to use, check out available models: https://huggingface.co/models?library=sentence-transformers&sort=trending
     #[arg(long)]
@@ -48,10 +64,25 @@ struct Args {
     normalize_embeddings: bool,
 }
 
+fn reverse_json(json: &Value) -> Value {
+    match json {
+        Value::Object(obj) => {
+            let mut new_obj = Map::new();
+            for (key, value) in obj.iter() {
+                new_obj.insert(value.to_string(), Value::String(key.to_string()));
+            }
+            Value::Object(new_obj)
+        }
+        _ => json.clone(),
+    }
+}
+
 impl Args {
-    fn build_model_and_tokenizer(&self) -> Result<(BertModel, Tokenizer)> {
+    fn build_model_and_tokenizer(&self) -> Result<(HubertForCTC, PathBuf, Value)> {
         let device = candle_examples::device(self.cpu)?;
-        let default_model = "facebook/hubert-large-ls960-ft".to_string();
+        let default_model = "alvanlii/hubert-large-ls960-ft-rust".to_string();
+        let path = std::path::PathBuf::from(default_model.clone());
+
         let default_revision = "main".to_string();
         let (model_id, revision) = match (self.model_id.to_owned(), self.revision.to_owned()) {
             (Some(model_id), Some(revision)) => (model_id, revision),
@@ -60,38 +91,52 @@ impl Args {
             (None, None) => (default_model, default_revision),
         };
 
-        let repo = Repo::with_revision(model_id, RepoType::Model, revision);
-        let (config_filename, tokenizer_filename, weights_filename) = if self.offline {
-            let cache = Cache::default();
+        let (config_filename, weights_filename, tokenizer_filename, input) = if path.exists() {
+            let mut config_filename = path.clone();
+            config_filename.push("config.json");
+            let mut tokenizer_filename = path.clone();
+            tokenizer_filename.push("vocab.json");
+            let mut model_filename = path;
+            model_filename.push("model.safetensors");
+            let input_path = self.input.clone().expect("Please specific file path");
             (
-                cache
-                    .get(&repo, "config.json")
-                    .ok_or(anyhow!("Missing config file in cache"))?,
-                cache
-                    .get(&repo, "tokenizer.json")
-                    .ok_or(anyhow!("Missing tokenizer file in cache"))?,
-                cache
-                    .get(&repo, "model.safetensors")
-                    .ok_or(anyhow!("Missing weights file in cache"))?,
+                config_filename,
+                model_filename,
+                tokenizer_filename,
+                std::path::PathBuf::from(input_path),
             )
         } else {
             let api = Api::new()?;
-            let api = api.repo(repo);
+            let dataset = api.dataset("Narsil/candle-examples".to_string());
+            let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+            let sample = if let Some(input) = &self.input {
+                if let Some(sample) = input.strip_prefix("sample:") {
+                    dataset.get(&format!("samples_{sample}.wav"))?
+                } else {
+                    std::path::PathBuf::from(input)
+                }
+            } else {
+                println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav");
+                dataset.get("samples_jfk.wav")?
+            };
             (
-                api.get("config.json")?,
-                api.get("tokenizer.json")?,
-                api.get("model.safetensors")?,
+                repo.get("config.json")?,
+                repo.get("model.safetensors")?,
+                repo.get("vocab.json")?,
+                sample,
             )
         };
-        let config = std::fs::read_to_string(config_filename)?;
-        let config: Config = serde_json::from_str(&config)?;
-        let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+        let config: Config = Config::_hubert_large_ft();
+        println!("{:?}", config);
+
+        let vocab_json:Value = serde_json::from_str(&std::fs::read_to_string(tokenizer_filename)?)?;
+        let tokenizer = reverse_json(&vocab_json);
 
         let weights = unsafe { candle::safetensors::MmapedFile::new(weights_filename)? };
         let weights = weights.deserialize()?;
         let vb = VarBuilder::from_safetensors(vec![weights], DTYPE, &device);
-        let model = BertModel::load(vb, &config)?;
-        Ok((model, tokenizer))
+        let model = HubertForCTC::load(vb, config)?;
+        Ok((model, input, tokenizer))
     }
 }
 
@@ -108,96 +153,49 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let start = std::time::Instant::now();
 
-    let (model, mut tokenizer) = args.build_model_and_tokenizer()?;
+    let (model, input, tokenizer) = args.build_model_and_tokenizer()?;
     let device = &model.device;
 
-    if let Some(prompt) = args.prompt {
-        let tokenizer = tokenizer
-            .with_padding(None)
-            .with_truncation(None)
-            .map_err(E::msg)?;
-        let tokens = tokenizer
-            .encode(prompt, true)
-            .map_err(E::msg)?
-            .get_ids()
-            .to_vec();
-        let token_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
-        let token_type_ids = token_ids.zeros_like()?;
-        println!("Loaded and encoded {:?}", start.elapsed());
-        for idx in 0..args.n {
-            let start = std::time::Instant::now();
-            let ys = model.forward(&token_ids, &token_type_ids)?;
-            if idx == 0 {
-                println!("{ys}");
-            }
-            println!("Took {:?}", start.elapsed());
-        }
-    } else {
-        let sentences = [
-            "The cat sits outside",
-            "A man is playing guitar",
-            "I love pasta",
-            "The new movie is awesome",
-            "The cat plays in the garden",
-            "A woman watches TV",
-            "The new movie is so great",
-            "Do you like pizza?",
-        ];
-        let n_sentences = sentences.len();
-        if let Some(pp) = tokenizer.get_padding_mut() {
-            pp.strategy = tokenizers::PaddingStrategy::BatchLongest
-        } else {
-            let pp = PaddingParams {
-                strategy: tokenizers::PaddingStrategy::BatchLongest,
-                ..Default::default()
-            };
-            tokenizer.with_padding(Some(pp));
-        }
-        let tokens = tokenizer
-            .encode_batch(sentences.to_vec(), true)
-            .map_err(E::msg)?;
-        let token_ids = tokens
-            .iter()
-            .map(|tokens| {
-                let tokens = tokens.get_ids().to_vec();
-                Ok(Tensor::new(tokens.as_slice(), device)?)
-            })
-            .collect::<Result<Vec<_>>>()?;
+    // read audio
+    let mut input = std::fs::File::open(input)?;
+    let (header, data) = wav::read(&mut input)?;
+    println!("loaded wav data: {header:?}");
+    if header.sampling_rate != SAMPLE_RATE as u32 {
+        anyhow::bail!("wav file must have a {} sampling rate", SAMPLE_RATE)
+    }
+    let data = data.as_sixteen().expect("expected 16 bit wav file");
+    let pcm_data: Vec<_> = data[..data.len() / header.channel_count as usize]
+        .iter()
+        .map(|v| *v as f32 / 32768.)
+        .collect();
+    println!("pcm data loaded {}", pcm_data.len());
 
-        let token_ids = Tensor::stack(&token_ids, 0)?;
-        let token_type_ids = token_ids.zeros_like()?;
-        println!("running inference on batch {:?}", token_ids.shape());
-        let embeddings = model.forward(&token_ids, &token_type_ids)?;
-        println!("generated embeddings {:?}", embeddings.shape());
-        // Apply some avg-pooling by taking the mean embedding value for all tokens (including padding)
-        let (_n_sentence, n_tokens, _hidden_size) = embeddings.dims3()?;
-        let embeddings = (embeddings.sum(1)? / (n_tokens as f64))?;
-        let embeddings = if args.normalize_embeddings {
-            normalize_l2(&embeddings)?
-        } else {
-            embeddings
-        };
-        println!("pooled embeddings {:?}", embeddings.shape());
+    let input_vec = Tensor::from_vec(pcm_data.clone(), (1, pcm_data.len()), &device)?;
+    let start = std::time::Instant::now();
+    println!("Starting");
+    let output_logits = model.forward(&input_vec)?;
+    let output = output_logits.argmax(D::Minus1)?;
+    println!("Elapsed {:?}", start.elapsed());
+    let output = output.squeeze(0)?;
+    let output_ids = output.to_vec1::<u32>()?;
+    // println!("{:?}", output.dims());
+    // println!("{:?}", output_ids);
 
-        let mut similarities = vec![];
-        for i in 0..n_sentences {
-            let e_i = embeddings.get(i)?;
-            for j in (i + 1)..n_sentences {
-                let e_j = embeddings.get(j)?;
-                let sum_ij = (&e_i * &e_j)?.sum_all()?.to_scalar::<f32>()?;
-                let sum_i2 = (&e_i * &e_i)?.sum_all()?.to_scalar::<f32>()?;
-                let sum_j2 = (&e_j * &e_j)?.sum_all()?.to_scalar::<f32>()?;
-                let cosine_similarity = sum_ij / (sum_i2 * sum_j2).sqrt();
-                similarities.push((cosine_similarity, i, j))
+    let mut result = String::new();
+    for key in output_ids.iter() {
+        if let Some(value) = tokenizer.get(key.to_string()) {
+            let mut curr_str = value.to_string();
+            curr_str = curr_str.replace("\"", "");
+            if curr_str != PAD_TOKEN {
+                result.push_str(&curr_str);
             }
-        }
-        similarities.sort_by(|u, v| v.0.total_cmp(&u.0));
-        for &(score, i, j) in similarities[..5].iter() {
-            println!("score: {score:.2} '{}' '{}'", sentences[i], sentences[j])
         }
     }
+    let re = Regex::new(r"\|+").unwrap();
+    result = re.replace_all(&result, " ").to_string();
+    println!("{}", result);
+
     Ok(())
 }
 
